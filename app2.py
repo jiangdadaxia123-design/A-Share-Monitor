@@ -176,8 +176,8 @@ if not final_df.empty:
 
     st.subheader("📊 实时动能监测大盘")
     styled_df = table_df.style\
-        .applymap(color_signal, subset=['综合信号'])\
-        .applymap(color_macd_hist, subset=['MACD柱'])\
+        .map(color_signal, subset=['综合信号'])\
+        .map(color_macd_hist, subset=['MACD柱'])\
         .background_gradient(subset=['RSI'], cmap='RdYlGn_r', vmin=20, vmax=80)\
         .format({'最新价': '{:.2f}', '涨跌幅': '{:.2f}%', 'MACD柱': '{:.3f}', 'SQZ动能': '{:.3f}'})
 
