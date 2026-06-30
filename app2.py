@@ -63,7 +63,7 @@ def fetch_stock_with_retry(code, max_retries=4):
 
 # ================= 获取 Top N（可调小测试） =================
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_top_n_stocks(n=50):
+def get_top_n_stocks(n=30):
     """
     加强版：多接口 + 更长重试 + 详细错误提示
     """
