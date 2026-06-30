@@ -3,61 +3,54 @@ import akshare as ak
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import concurrent.futures
 from datetime import datetime, timedelta
 import time
 
 st.set_page_config(page_title="A股 Top 动能监测仪", layout="wide", page_icon="📈")
-st.title("📈 A股 Top 20 动能监测仪（稳定加强版）")
+st.title("📈 A股 Top 20 动能监测仪（超稳版）")
 
-# ================== 获取Top股票（已修复列名问题） ==================
+# ================== 获取Top股票 ==================
 @st.cache_data(ttl=7200, show_spinner=False)
 def get_top_n_stocks(n=20):
     interfaces = [
-        lambda: ak.stock_zh_a_spot(),        # 新浪（优先）
-        lambda: ak.stock_zh_a_spot_em(),     # 东方财富（备用）
+        lambda: ak.stock_zh_a_spot(),
+        lambda: ak.stock_zh_a_spot_em(),
     ]
     
     for attempt in range(8):
         for interface_func in interfaces:
             try:
-                time.sleep(7 + attempt * 3)   # 更长的等待时间
+                time.sleep(7 + attempt * 3)
                 df = interface_func()
-                
                 if df is not None and not df.empty:
-                    # 智能选择可用列（解决换手率不存在的问题）
                     base_cols = ['代码', '名称', '最新价', '涨跌幅', '成交额']
                     available_cols = [col for col in base_cols if col in df.columns]
-                    
                     if '换手率' in df.columns:
                         available_cols.append('换手率')
-                    
                     df = df.sort_values(by="成交额", ascending=False).head(n)
                     return df[available_cols].copy()
-                    
             except Exception as e:
-                st.sidebar.warning(f"第{attempt+1}次尝试失败: {str(e)[:130]}")
-                time.sleep(6)
+                st.sidebar.warning(f"Top列表 第{attempt+1}次失败: {str(e)[:100]}")
+                time.sleep(5)
     
-    st.error("⚠️ 接口持续限流，请等待 **10-15分钟** 后点击下方按钮重试")
-    if st.button("🔄 清除缓存并重试"):
+    st.error("Top列表获取失败，请等待10分钟后重试")
+    if st.button("🔄 清除缓存重试"):
         st.cache_data.clear()
         st.rerun()
     return pd.DataFrame()
 
-
-# ================== 单股票指标计算 ==================
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_stock_with_retry(code, max_retries=5):
+# ================== 单只股票指标计算（顺序执行 + 超强重试） ==================
+def fetch_stock_with_retry(code, max_retries=6):
     for attempt in range(max_retries):
         try:
-            time.sleep(1.5 + attempt * 0.7)
+            time.sleep(2.5 + attempt * 1.2)   # 更长的等待
             hist = ak.stock_zh_a_hist(
-                symbol=code, period="daily",
+                symbol=code,
+                period="daily",
                 start_date=(datetime.now() - timedelta(days=160)).strftime("%Y%m%d"),
                 adjust="qfq"
             )
-            if hist.empty or len(hist) < 35:
+            if hist.empty or len(hist) < 30:   # 降低要求
                 return None
 
             hist = hist.rename(columns={
@@ -78,7 +71,7 @@ def fetch_stock_with_retry(code, max_retries=5):
             hist['MACDs'] = hist['MACD'].ewm(span=9, adjust=False).mean()
             hist['MACDh'] = hist['MACD'] - hist['MACDs']
 
-            # Squeeze动能
+            # SQZ
             sma20 = hist['close'].rolling(20).mean()
             hist['SQZ_MOM'] = (hist['close'] - sma20).rolling(10).mean()
 
@@ -89,54 +82,57 @@ def fetch_stock_with_retry(code, max_retries=5):
                 'SQZ动能': round(latest['SQZ_MOM'], 3),
                 '_hist_data': hist
             }
-        except:
+        except Exception as e:
             if attempt == max_retries - 1:
+                st.sidebar.warning(f"{code} 最终失败: {str(e)[:80]}")
                 return None
-            time.sleep(4 + attempt * 2)
+            time.sleep(5 + attempt * 2)
     return None
-
 
 # ================== 主程序 ==================
 top_df = get_top_n_stocks(20)
 
 if not top_df.empty:
-    st.success(f"成功获取 Top {len(top_df)} 只股票")
+    st.success(f"成功获取 Top {len(top_df)} 只股票列表")
     
-    progress = st.progress(0, text="正在计算指标（低并发防限流）...")
+    progress = st.progress(0, text="正在逐个计算指标（顺序模式，最稳）...")
     results = []
+    success_count = 0
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {executor.submit(fetch_stock_with_retry, code): code 
-                   for code in top_df['代码']}
-        
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            data = future.result()
-            if data:
-                idx = top_df[top_df['代码'] == futures[future]].index[0]
-                row = top_df.loc[idx].to_dict()
-                row.update(data)
-                results.append(row)
-            progress.progress((i + 1) / len(futures))
+    for i, (_, row) in enumerate(top_df.iterrows()):
+        code = row['代码']
+        data = fetch_stock_with_retry(code)
+        if data:
+            row_dict = row.to_dict()
+            row_dict.update(data)
+            results.append(row_dict)
+            success_count += 1
+        progress.progress((i + 1) / len(top_df))
     
     progress.empty()
     final_df = pd.DataFrame(results)
+    
+    st.info(f"指标计算成功率：{success_count}/{len(top_df)} 只")
     
     if not final_df.empty:
         def get_signal(row):
             rsi = row.get('RSI', 50)
             macd = row.get('MACD柱', 0)
-            if pd.isna(rsi): return "数据不足"
-            if rsi < 35 and macd > 0: return "🟢 强买入"
-            if rsi > 70: return "🔴 风险"
+            if pd.isna(rsi):
+                return "数据不足"
+            if rsi < 35 and macd > 0:
+                return "🟢 强买入"
+            if rsi > 70:
+                return "🔴 风险"
             return "🟡 中性"
         
         final_df['综合信号'] = final_df.apply(get_signal, axis=1)
         
-        # 筛选
+        # 筛选控件
         col1, col2, col3 = st.columns(3)
-        with col1: sort_by = st.selectbox("排序", ["成交额降序", "RSI升序", "MACD柱降序"])
-        with col2: filter_sig = st.selectbox("筛选", ["全部", "🟢 强买入", "🔴 风险", "🟡 中性"])
-        with col3: kw = st.text_input("搜索代码/名称")
+        with col1: sort_by = st.selectbox("排序方式", ["成交额降序", "RSI升序", "MACD柱降序"])
+        with col2: filter_sig = st.selectbox("信号筛选", ["全部", "🟢 强买入", "🔴 风险", "🟡 中性"])
+        with col3: kw = st.text_input("🔍 搜索")
         
         display = final_df.copy()
         if sort_by == "成交额降序":
@@ -152,12 +148,14 @@ if not top_df.empty:
             display = display[display['代码'].astype(str).str.contains(kw) | display['名称'].str.contains(kw)]
         
         st.subheader("📊 实时动能监测表")
-        st.dataframe(display[['代码','名称','最新价','成交额','RSI','MACD柱','SQZ动能','综合信号']], 
-                     use_container_width=True, hide_index=True)
+        st.dataframe(
+            display[['代码','名称','最新价','成交额','RSI','MACD柱','SQZ动能','综合信号']],
+            use_container_width=True, hide_index=True
+        )
         
         # K线图
         if not display.empty:
-            selected = st.selectbox("选择股票查看K线", display['名称'].tolist())
+            selected = st.selectbox("选择股票查看详细K线", display['名称'].tolist())
             if selected:
                 sel = display[display['名称'] == selected].iloc[0]
                 hist = sel['_hist_data']
@@ -173,8 +171,8 @@ if not top_df.empty:
                 fig.update_layout(height=780, template="plotly_dark")
                 st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("指标计算失败，请稍后刷新。")
+        st.error("所有股票指标计算失败（严重限流）。建议等待15分钟后重试。")
 else:
-    st.warning("获取股票列表失败，请等待10-15分钟后重试。")
+    st.warning("获取股票列表失败，请等待后重试。")
 
-st.caption("数据来源：新浪财经 + 东方财富 | 已优化防限流 | 缓存2小时")
+st.caption("数据来源：新浪 + 东方财富 | 顺序执行模式 | 已最大化防限流")
