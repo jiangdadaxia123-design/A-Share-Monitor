@@ -63,87 +63,129 @@ def fetch_stock_with_retry(code, max_retries=4):
 
 # ================= 获取 Top N（可调小测试） =================
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_top_n_stocks(n=30):
-    """
-    加强版：多接口 + 更长重试 + 详细错误提示
-    """
+def get_top_n_stocks(n=30):   # 先用30只测试，稳定后可改50
     interfaces = [
         lambda: ak.stock_zh_a_spot_em(),
-        lambda: ak.stock_zh_a_spot(),           # 新浪备用
+        lambda: ak.stock_zh_a_spot(),   # 新浪备用接口
     ]
     
-    for attempt in range(5):  # 增加到5次重试
-        for interface in interfaces:
+    for attempt in range(5):
+        for interface_func in interfaces:
             try:
-                df = interface()
+                df = interface_func()
                 if not df.empty:
                     df = df.sort_values(by="成交额", ascending=False).head(n)
                     return df[['代码', '名称', '最新价', '涨跌幅', '成交额', '换手率']].copy()
             except Exception as e:
-                # 打印真实错误（方便调试）
-                st.sidebar.warning(f"第{attempt+1}次尝试失败: {str(e)[:100]}")
-                time.sleep(4 + attempt * 2)  # 指数退避：4s, 6s, 8s...
+                st.sidebar.warning(f"第{attempt+1}次尝试失败: {str(e)[:120]}")
+                time.sleep(4 + attempt * 2)
     
-    # 所有尝试都失败
-    st.error("⚠️ 东方财富接口持续限流/异常，请等待 5~10 分钟后点击下方按钮重试")
-    if st.button("🔄 强制重新获取 Top 股票列表"):
+    # 所有接口都失败
+    st.error("⚠️ 东方财富/新浪接口持续限流，请等待5-10分钟后点击下方按钮重试")
+    if st.button("🔄 强制刷新 Top 股票列表"):
         st.cache_data.clear()
         st.rerun()
     return pd.DataFrame()
+
+
+# ================= 主程序 =================
+top_df = get_top_n_stocks(30)
+
+if not top_df.empty:
+    # ================= 计算指标部分（保持你原来的逻辑） =================
+    progress = st.progress(0, text="正在计算技术指标（低并发防限流）...")
+    
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {executor.submit(fetch_stock_with_retry, row['代码']): row 
+                   for _, row in top_df.iterrows()}
+        
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            row = futures[future]
+            data = future.result()
+            if data:
+                row_dict = row.to_dict()
+                row_dict.update(data)
+                results.append(row_dict)
+            progress.progress((i + 1) / len(futures))
+    
+    progress.empty()
+    final_df = pd.DataFrame(results)
     
     if not final_df.empty:
-        # 简单信号生成（可根据需要扩展）
+        # 生成综合信号
         def get_signal(row):
-            if pd.isna(row.get('RSI')): return "数据不足"
-            if row['RSI'] < 30 and row.get('MACD柱', 0) > 0: return "强买入"
-            if row['RSI'] > 70: return "风险"
+            rsi = row.get('RSI', 50)
+            macd = row.get('MACD柱', 0)
+            if pd.isna(rsi):
+                return "数据不足"
+            if rsi < 35 and macd > 0:
+                return "强买入"
+            if rsi > 70:
+                return "风险"
             return "中性"
         
         final_df['综合信号'] = final_df.apply(get_signal, axis=1)
         
-        # ================= 交互筛选 =================
+        # ================= 筛选控件 =================
         col1, col2, col3 = st.columns(3)
-        with col1: sort_by = st.selectbox("排序方式", ["成交额降序", "RSI升序", "MACD柱降序"])
-        with col2: filter_sig = st.selectbox("信号筛选", ["全部", "强买入", "风险", "中性"])
-        with col3: kw = st.text_input("搜索代码/名称")
+        with col1:
+            sort_by = st.selectbox("排序方式", ["成交额降序", "RSI升序", "MACD柱降序"])
+        with col2:
+            filter_sig = st.selectbox("信号筛选", ["全部", "强买入", "风险", "中性"])
+        with col3:
+            kw = st.text_input("🔍 搜索代码或名称")
         
         display = final_df.copy()
+        
         if sort_by == "成交额降序":
             display = display.sort_values("成交额", ascending=False)
         elif sort_by == "RSI升序":
-            display = display.sort_values("RSI")
+            display = display.sort_values("RSI", ascending=True)
         else:
             display = display.sort_values("MACD柱", ascending=False)
-            
+        
         if filter_sig != "全部":
             display = display[display['综合信号'] == filter_sig]
         if kw:
-            display = display[display['代码'].str.contains(kw) | display['名称'].str.contains(kw)]
+            mask = display['代码'].astype(str).str.contains(kw) | display['名称'].str.contains(kw)
+            display = display[mask]
         
-        st.subheader(f"📊 Top {len(display)} 只股票实时动能")
+        # ================= 表格展示 =================
+        st.subheader(f"📊 Top {len(display)} 只股票实时动能监测")
         st.dataframe(
-            display[['代码','名称','最新价','成交额','RSI','MACD柱','SQZ动能','综合信号']],
+            display[['代码', '名称', '最新价', '成交额', 'RSI', 'MACD柱', 'SQZ动能', '综合信号']],
             use_container_width=True,
             hide_index=True
         )
         
-        # ================= 单股K线 =================
-        selected_name = st.selectbox("选择股票查看详细K线", display['名称'].tolist())
-        if selected_name:
-            sel_row = display[display['名称'] == selected_name].iloc[0]
-            hist = sel_row['_hist_data']
-            
-            fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                               subplot_titles=(f"{selected_name} K线", "MACD柱", "RSI"))
-            fig.add_trace(go.Candlestick(x=hist.index, open=hist['open'], high=hist['high'],
-                                         low=hist['low'], close=hist['close']), row=1, col=1)
-            fig.add_trace(go.Bar(x=hist.index, y=hist['MACDh'], name="MACD柱"), row=2, col=1)
-            fig.add_trace(go.Scatter(x=hist.index, y=hist['RSI'], name="RSI"), row=3, col=1)
-            fig.add_hline(y=70, line_dash="dash", line_color="red", row=3)
-            fig.add_hline(y=30, line_dash="dash", line_color="green", row=3)
-            fig.update_layout(height=750, template="plotly_dark")
-            st.plotly_chart(fig, use_container_width=True)
+        # ================= 单股K线图 =================
+        if not display.empty:
+            selected = st.selectbox("选择个股查看详细K线 + 指标", display['名称'].tolist())
+            if selected:
+                sel = display[display['名称'] == selected].iloc[0]
+                hist = sel['_hist_data']
+                
+                fig = make_subplots(
+                    rows=3, cols=1, shared_xaxes=True,
+                    subplot_titles=(f"{selected} K线", "MACD柱状图", "RSI指标"),
+                    row_heights=[0.55, 0.25, 0.2]
+                )
+                fig.add_trace(go.Candlestick(
+                    x=hist.index, open=hist['open'], high=hist['high'],
+                    low=hist['low'], close=hist['close'], name="K线"
+                ), row=1, col=1)
+                fig.add_trace(go.Bar(
+                    x=hist.index, y=hist['MACDh'], name="MACD柱", marker_color="orange"
+                ), row=2, col=1)
+                fig.add_trace(go.Scatter(
+                    x=hist.index, y=hist['RSI'], name="RSI", line=dict(color="purple")
+                ), row=3, col=1)
+                fig.add_hline(y=70, line_dash="dash", line_color="red", row=3)
+                fig.add_hline(y=30, line_dash="dash", line_color="green", row=3)
+                fig.update_layout(height=780, template="plotly_dark", showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
     else:
-        st.error("所有股票数据获取失败（疑似严重限流）。请等待5-10分钟后刷新，或减少Top数量。")
+        st.warning("指标计算失败（可能是单只股票限流），请稍后刷新。")
 else:
     st.warning("Top股票列表获取失败，请稍后刷新。")
