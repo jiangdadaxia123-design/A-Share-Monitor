@@ -63,37 +63,33 @@ def fetch_stock_with_retry(code, max_retries=4):
 
 # ================= 获取 Top N（可调小测试） =================
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_top_n_stocks(n=50):  # 建议先用 30~50 测试
-    for _ in range(3):
-        try:
-            df = ak.stock_zh_a_spot_em()
-            df = df.sort_values(by="成交额", ascending=False).head(n)
-            return df[['代码', '名称', '最新价', '涨跌幅', '成交额', '换手率']].copy()
-        except:
-            time.sleep(3)
+def get_top_n_stocks(n=50):
+    """
+    加强版：多接口 + 更长重试 + 详细错误提示
+    """
+    interfaces = [
+        lambda: ak.stock_zh_a_spot_em(),
+        lambda: ak.stock_zh_a_spot(),           # 新浪备用
+    ]
+    
+    for attempt in range(5):  # 增加到5次重试
+        for interface in interfaces:
+            try:
+                df = interface()
+                if not df.empty:
+                    df = df.sort_values(by="成交额", ascending=False).head(n)
+                    return df[['代码', '名称', '最新价', '涨跌幅', '成交额', '换手率']].copy()
+            except Exception as e:
+                # 打印真实错误（方便调试）
+                st.sidebar.warning(f"第{attempt+1}次尝试失败: {str(e)[:100]}")
+                time.sleep(4 + attempt * 2)  # 指数退避：4s, 6s, 8s...
+    
+    # 所有尝试都失败
+    st.error("⚠️ 东方财富接口持续限流/异常，请等待 5~10 分钟后点击下方按钮重试")
+    if st.button("🔄 强制重新获取 Top 股票列表"):
+        st.cache_data.clear()
+        st.rerun()
     return pd.DataFrame()
-
-# ================= 主流程 =================
-top_df = get_top_n_stocks(50)  # 先用50只测试，稳定后再调大
-
-if not top_df.empty:
-    progress = st.progress(0, text="正在计算技术指标（已降低并发防限流）...")
-    
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:  # 关键：改成2
-        futures = {executor.submit(fetch_stock_with_retry, row['代码']): row for _, row in top_df.iterrows()}
-        
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            row = futures[future]
-            data = future.result()
-            if data:
-                row = row.to_dict()
-                row.update(data)
-                results.append(row)
-            progress.progress((i + 1) / len(futures))
-    
-    progress.empty()
-    final_df = pd.DataFrame(results)
     
     if not final_df.empty:
         # 简单信号生成（可根据需要扩展）
